@@ -244,7 +244,7 @@ export const updateGuestProfile = onRequest(async (req, res) => {
 
 export const getImage = onRequest({cors: true}, async (req, res) => {
   // 1. Get the image name from the URL (e.g., /getImage?id=123)
-  const imageId = req.query.id.;
+  const imageId = req.query.id;
 
   if (!imageId) {
     res.status(400).send("Missing Image ID");
