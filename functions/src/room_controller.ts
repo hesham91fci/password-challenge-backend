@@ -2,6 +2,7 @@ import {onRequest} from "firebase-functions/https";
 import type {Request} from "firebase-functions/https";
 import {FieldValue, getFirestore} from "firebase-admin/firestore";
 import type {Firestore} from "firebase-admin/firestore";
+import {onDocumentCreated} from "firebase-functions/v2/firestore";
 import type {Room} from "./models/room";
 import type {
   FinalAssignment,
@@ -11,7 +12,6 @@ import type {
 import type {RoomUser} from "./models/room_user";
 import type {RoomType} from "./models/room_type";
 import type {Team} from "./models/team";
-import {onDocumentUpdated} from "firebase-functions/firestore";
 
 const CODE_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -186,7 +186,7 @@ async function allocateUniqueRoomCode(db: Firestore): Promise<string> {
  * Body: `{ "uid": string, "roomType": "public" | "private" }`.
  * Verifies `users/{uid}` exists, then creates `rooms/{autoId}` with Firestore’s
  * generated document id stored as `id` and a distinct random `code` field.
- * Roster is the `users` array on the room document.
+ * Host is written to `rooms/{roomId}/users/{uid}`.
  */
 export const createRoom = onRequest({cors: true}, async (req, res) => {
   if (req.method !== "POST") {
@@ -262,13 +262,13 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
           const roomData: Room = {
             id: roomRef.id,
             code,
-            messages: [],
             type: roomType,
             turnsPerPlayerHistory: [],
             playersToGuess: [],
-            users: [hostRoomUser],
+            usersCount: 1,
           };
           tx.set(roomRef, roomData);
+          tx.set(roomRef.collection("users").doc(uid), hostRoomUser);
           return roomData;
         });
         break;
@@ -294,64 +294,21 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
 });
 
 /**
- * Parses four distinct non-empty `userId`s from embedded `users`, or null.
- * @param {unknown} users Room document `users` field.
- * @return {string[] | null} UIDs or null.
+ * When a room user doc is created, completes team/role assignment once four
+ * distinct users exist and roles are not yet set.
  */
-function embeddedUserIds(users: unknown): string[] | null {
-  if (!Array.isArray(users) || users.length !== 4) {
-    return null;
-  }
-  const ids = users.map((u) => {
-    if (u && typeof u === "object" && "userId" in u) {
-      const id = (u as {userId: unknown}).userId;
-      return typeof id === "string" ? id.trim() : "";
-    }
-    return "";
-  });
-  if (ids.some((id) => !id)) {
-    return null;
-  }
-  if (new Set(ids).size !== 4) {
-    return null;
-  }
-  return ids;
-}
-
-export const completeRoom = onDocumentUpdated(
-  "rooms/{roomId}",
+export const completeRoom = onDocumentCreated(
+  {
+    document: "rooms/{roomId}/users/{userId}",
+    region: "europe-west1",
+  },
   async (event) => {
-    const change = event.data;
-    if (!change?.after.exists) {
-      return;
-    }
-
-    const after = change.after.data() as Room | undefined;
-    if (!after?.id) {
-      return;
-    }
-
-    const userIdsEarly = embeddedUserIds(after.users);
-    if (!userIdsEarly) {
-      return;
-    }
-
-    const hist = after.turnsPerPlayerHistory;
-    if (Array.isArray(hist) && hist.length > 0) {
-      return;
-    }
-
-    const beforeData = change.before.exists ?
-      (change.before.data() as Room | undefined) :
-      undefined;
-    const beforeUsers = beforeData?.users;
-    const beforeLen = Array.isArray(beforeUsers) ? beforeUsers.length : 0;
-    if (beforeLen >= 4) {
+    const roomId = event.params.roomId;
+    if (!roomId) {
       return;
     }
 
     const db = getFirestore();
-    const roomId = event.params.roomId;
     const roomRef = db.collection("rooms").doc(roomId);
 
     try {
@@ -372,24 +329,26 @@ export const completeRoom = onDocumentUpdated(
           return;
         }
 
-        const embedded = roomData.users;
-        if (!Array.isArray(embedded) || embedded.length !== 4) {
+        const usersQuery = roomRef.collection("users").limit(16);
+        const usersSnap = await tx.get(usersQuery);
+        if (usersSnap.size !== 4) {
           return;
         }
 
-        for (const raw of embedded) {
-          const ru = raw as {role?: unknown};
-          if (ru.role != null) {
+        const userDocs = usersSnap.docs;
+        const ids = userDocs.map((d) => d.id);
+        if (new Set(ids).size !== 4) {
+          return;
+        }
+
+        for (const d of userDocs) {
+          const role = (d.data() as {role?: unknown}).role;
+          if (role != null) {
             return;
           }
         }
 
-        const userIds = embeddedUserIds(embedded);
-        if (!userIds) {
-          return;
-        }
-
-        const shuffled = shuffleUsers([...userIds]);
+        const shuffled = shuffleUsers([...ids]);
         const teamAssignments = assignTeams(shuffled);
         const roleAssignments = assignRolesPerTeam(teamAssignments);
         const startingTeam = pickStartingTeam();
@@ -402,30 +361,32 @@ export const completeRoom = onDocumentUpdated(
           finalAssignments.map((a) => [a.userId, a]),
         );
 
-        const updatedUsers: RoomUser[] = embedded.map((raw) => {
-          const row = raw as Partial<RoomUser>;
-          const uid =
-            typeof row.userId === "string" ? row.userId.trim() : "";
+        for (const d of userDocs) {
+          const uid = d.id;
+          const row = d.data() as Partial<RoomUser>;
           const a = assignmentByUserId.get(uid);
           if (!a) {
             throw new Error(`Missing assignment for user ${uid}`);
           }
-          return {
-            userId: typeof row.userId === "string" ? row.userId : null,
-            displayName:
-              typeof row.displayName === "string" ? row.displayName : null,
-            photoUrl: typeof row.photoUrl === "string" ? row.photoUrl : null,
-            role: a.role,
-            team: a.team,
-            isHost: row.isHost === true,
-            isActiveTurn: a.isActiveTurn,
-          };
-        });
+          tx.set(
+            roomRef.collection("users").doc(uid),
+            {
+              userId: typeof row.userId === "string" ? row.userId : uid,
+              displayName:
+                typeof row.displayName === "string" ? row.displayName : null,
+              photoUrl: typeof row.photoUrl === "string" ? row.photoUrl : null,
+              role: a.role,
+              team: a.team,
+              isHost: row.isHost === true,
+              isActiveTurn: a.isActiveTurn,
+            },
+            {merge: true},
+          );
+        }
 
         tx.set(
           roomRef,
           {
-            users: updatedUsers,
             turnsPerPlayerHistory: FieldValue.arrayUnion(startingTeam),
           },
           {merge: true},
