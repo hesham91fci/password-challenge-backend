@@ -13,4 +13,5 @@ export interface Room {
   turnsPerPlayerHistory: Team[];
   playersToGuess: GamePlayer[];
   usersCount: number;
+  score: string;
 }

@@ -266,6 +266,7 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
             turnsPerPlayerHistory: [],
             playersToGuess: [],
             usersCount: 1,
+            score: "0-0",
           };
           tx.set(roomRef, roomData);
           tx.set(roomRef.collection("users").doc(uid), hostRoomUser);
