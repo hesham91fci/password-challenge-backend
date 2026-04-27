@@ -25,3 +25,4 @@ admin.initializeApp();
 
 export {updateGuestProfile, getImage} from "./user_controller";
 export {createRoom, completeRoom} from "./room_controller";
+export {generateClue, guessPlayer} from "./bot_controller";
