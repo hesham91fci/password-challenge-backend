@@ -1,24 +1,31 @@
 import {onRequest} from "firebase-functions/https";
 import type {Request} from "firebase-functions/https";
+import type {Response} from "express";
 import {getStorage} from "firebase-admin/storage";
 import {getFirestore} from "firebase-admin/firestore";
 import * as admin from "firebase-admin";
 
 /**
- * Image id under `images/{id}.png` in Storage; used in getImage URLs for
- * guest avatars.
+ * Image id under `images/{id}.png` in Storage; served by the avatarImage
+ * endpoint (guest default).
  */
-const GUEST_AVATAR_IMAGE_ID =
+export const GUEST_AVATAR_IMAGE_ID =
   "am-a-19-year-old-multimedia-artist-student-from-manila--21";
 
 /**
- * Builds a full URL to the getImage function for the given storage image id.
+ * Builds a full URL to a Cloud Function in europe-west1 (emulator or prod).
  * @param {Request} req Incoming HTTP request (host / path for emulator).
- * @param {string} imageId File basename under images/ (no .png).
- * @return {string} Absolute getImage URL including id query param.
+ * @param {string} functionName Deployed function name (final path segment).
+ * @param {Record<string, string>} query Optional query params.
+ * @return {string} Absolute function URL.
  */
-function buildGetImageUrl(req: Request, imageId: string): string {
-  const idParam = encodeURIComponent(imageId);
+function buildCloudFunctionUrl(
+  req: Request,
+  functionName: string,
+  query: Record<string, string> = {},
+): string {
+  const qs = new URLSearchParams(query).toString();
+  const suffix = qs ? `?${qs}` : "";
   const host = req.get("host");
   const proto =
     (typeof req.headers["x-forwarded-proto"] === "string" ?
@@ -33,85 +40,71 @@ function buildGetImageUrl(req: Request, imageId: string): string {
       req.path;
 
   if (host && orig.includes("europe-west1")) {
-    const base = orig.replace(/\/[^/]+$/, "/getImage");
-    return `${proto}://${host}${base}?id=${idParam}`;
+    const base = orig.replace(/\/[^/]+$/, `/${functionName}`);
+    return `${proto}://${host}${base}${suffix}`;
   }
 
   const projectId =
     process.env.GCLOUD_PROJECT || admin.app().options.projectId || "";
   return (
-    `https://europe-west1-${projectId}.cloudfunctions.net/getImage?id=` +
-    idParam
+    `https://europe-west1-${projectId}.cloudfunctions.net/${functionName}` +
+    suffix
   );
 }
 
 /**
- * Picks a random Guest_0..999999 not already used as displayName in users.
- * Does not write to Firestore.
- * @return {Promise<string>} Chosen displayName.
+ * Builds a full URL to an image-serving function for the given storage id.
+ * @param {Request} req Incoming HTTP request (host / path for emulator).
+ * @param {string} imageId File basename in Storage (no .png).
+ * @param {string} functionName Target function (e.g. `getImage`).
+ * @return {string} Absolute URL with `id` query param.
  */
-async function allocateUniqueGuestDisplayName(): Promise<string> {
-  const db = getFirestore();
-  const users = db.collection("users");
-  const maxAttempts = 40;
-
-  for (let i = 0; i < maxAttempts; i++) {
-    const candidate = `Guest_${Math.floor(Math.random() * 1_000_000)}`;
-    try {
-      await db.runTransaction(async (tx) => {
-        const taken = await tx.get(
-          users.where("displayName", "==", candidate).limit(1),
-        );
-        if (!taken.empty) {
-          throw new Error("collision");
-        }
-      });
-      return candidate;
-    } catch {
-      // Retry with another candidate (collision or transaction conflict).
-    }
-  }
-
-  throw new Error("Could not allocate a unique guest displayName");
+export function buildAvatarImageUrl(
+  req: Request,
+  imageId: string,
+  functionName: string,
+): string {
+  return buildCloudFunctionUrl(req, functionName, {id: imageId});
 }
 
 /**
- * Merges guest displayName and photoUrl into users/{uid}. Fails if displayName
- * is taken by another user (e.g. concurrent allocation).
- * @param {string} uid Auth / app user id (document id).
- * @param {string} displayName Unique guest display name.
- * @param {string} photoUrl Avatar URL pointing at getImage.
+ * Guest default avatar URL (avatarImage endpoint, no query params).
+ * @param {Request} req Incoming HTTP request.
+ * @return {string} Absolute avatarImage URL.
+ */
+export function buildGuestAvatarImageUrl(req: Request): string {
+  return buildCloudFunctionUrl(req, "avatarImage");
+}
+
+/**
+ * Streams a PNG from Storage by image id (basename without .png).
+ * @param {string} imageId Storage object basename.
+ * @param {Response} res HTTP response to pipe the image into.
  * @return {Promise<void>}
  */
-async function mergeGuestProfileToFirestore(
-  uid: string,
-  displayName: string,
-  photoUrl: string,
-): Promise<void> {
-  const db = getFirestore();
-  const users = db.collection("users");
-  await db.runTransaction(async (tx) => {
-    const taken = await tx.get(
-      users.where("displayName", "==", displayName).limit(1),
-    );
-    if (!taken.empty && taken.docs[0].id !== uid) {
-      throw new Error("displayName taken");
-    }
-    tx.set(users.doc(uid), {
-      displayName,
-      photoUrl,
-      uid,
-    }, {merge: true});
-  });
+async function streamImageById(imageId: string, res: Response): Promise<void> {
+  const bucket = getStorage().bucket();
+  const file = bucket.file(`${imageId}.png`);
+  const [exists] = await file.exists();
+  if (!exists) {
+    res.status(404).send("Image not found");
+    return;
+  }
+  const stream = file.createReadStream();
+  res.setHeader("Content-Type", "image/png");
+  stream.pipe(res);
 }
 
+const INVALID_DISPLAY_NAME_CHARS = /[\]:[{}'"#$!%^&*()+=\s\\/-]/;
+
 /**
- * Reads uid from query `?uid=` or JSON body `{ "uid": "..." }`.
+ * Reads displayName from query `?displayName=` or JSON body
+ * `{ "displayName": "..." }`.
  * @param {Request} req HTTP request.
- * @return {string} Trimmed uid or empty if missing.
+ * @return {string} Trimmed displayName or empty if missing.
  */
-function getUidFromRequest(req: Request): string {
-  const q = req.query.uid;
+function getDisplayNameFromRequest(req: Request): string {
+  const q = req.query.displayName;
   if (typeof q === "string" && q.trim()) {
     return q.trim();
   }
@@ -141,105 +134,67 @@ function getUidFromRequest(req: Request): string {
   if (
     body &&
     typeof body === "object" &&
-    "uid" in body &&
-    typeof (body as {uid: unknown}).uid === "string"
+    "displayName" in body &&
+    typeof (body as {displayName: unknown}).displayName === "string"
   ) {
-    const u = (body as {uid: string}).uid.trim();
-    return u;
+    return (body as {displayName: string}).displayName.trim();
   }
   return "";
 }
 
 /**
- * PATCH /updateGuestProfile
- * Updates an existing Auth user's guest profile in Firestore only: assigns a
- * unique Guest_0..Guest_999999 displayName and guest avatar photoUrl.
- * Call with `uid` in the query string or JSON body. Returns 404 if the Auth
- * user does not exist. Response body is JSON `{ uid, displayName, email,
- * photoUrl }` (email from Auth, unchanged).
+ * GET /checkDisplayName
+ * Query or body: `displayName`. Returns `{ available: true }` when the name
+ * is at least 6 characters, passes character rules, and is not already used
+ * in `users`.
+ * Otherwise `{ available: false }`.
  */
-export const updateGuestProfile = onRequest(async (req, res) => {
-  if (req.method !== "PATCH") {
-    res.setHeader("Allow", "PATCH");
-    res.status(405).json({success: false});
+export const checkDisplayName = onRequest(async (req, res) => {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    res.status(405).json({available: false});
     return;
   }
 
-  const uid = getUidFromRequest(req);
-  if (!uid) {
-    res.status(400).json({success: false});
+  const displayName = getDisplayNameFromRequest(req);
+  if (
+    !displayName ||
+    displayName.length < 6 ||
+    INVALID_DISPLAY_NAME_CHARS.test(displayName)
+  ) {
+    res.json({available: false});
     return;
   }
 
-  let userRecord: admin.auth.UserRecord;
-  try {
-    userRecord = await admin.auth().getUser(uid);
-  } catch (e: unknown) {
-    const code =
-      e && typeof e === "object" && "code" in e ?
-        String((e as {code: unknown}).code) :
-        "";
-    if (code === "auth/user-not-found") {
-      res.status(404).json({success: false});
-      return;
-    }
-    res.status(500).json({success: false});
-    return;
-  }
+  const snapshot = await getFirestore()
+    .collection("users")
+    .where("displayName", "==", displayName)
+    .limit(1)
+    .get();
 
-  const photoUrl = buildGetImageUrl(req, GUEST_AVATAR_IMAGE_ID);
-
-  try {
-    const displayName = await (async (): Promise<string> => {
-      const maxAttempts = 40;
-      for (let a = 0; a < maxAttempts; a++) {
-        const name = await allocateUniqueGuestDisplayName();
-        try {
-          await mergeGuestProfileToFirestore(uid, name, photoUrl);
-          return name;
-        } catch {
-          if (a === maxAttempts - 1) {
-            throw new Error("Could not persist guest profile");
-          }
-        }
-      }
-      throw new Error("unreachable");
-    })();
-
-    const email = userRecord.email ?? null;
-    res.json({uid, displayName, email, photoUrl});
-  } catch {
-    res.status(500).json({success: false});
-  }
+  res.json({available: snapshot.empty});
 });
 
 export const getImage = onRequest({cors: true}, async (req, res) => {
-  // 1. Get the image name from the URL (e.g., /getImage?id=123)
-  const imageId = req.query.id;
+  const rawId = req.query.id;
+  const imageId = Array.isArray(rawId) ? rawId[0] : rawId;
 
-  if (!imageId) {
+  if (!imageId || typeof imageId !== "string") {
     res.status(400).send("Missing Image ID");
     return;
   }
 
   try {
-    const bucket = getStorage().bucket();
-    // Use the real, long filename here that you've stored in your DB
-    const file = bucket.file(`${imageId}.png`);
+    await streamImageById(imageId, res);
+  } catch {
+    res.status(500).send("Error fetching image");
+  }
+});
 
-    // 2. Check if file exists
-    const [exists] = await file.exists();
-    if (!exists) {
-      res.status(404).send("Image not found");
-      return;
-    }
-
-    // 3. Stream the file directly to the user
-    // This hides the Firebase URL entirely!
-    const stream = file.createReadStream();
-
-    res.setHeader("Content-Type", "image/png");
-    stream.pipe(res);
+/** Default guest avatar; no query params. */
+export const avatarImage = onRequest({cors: true}, async (req, res) => {
+  try {
+    await streamImageById(GUEST_AVATAR_IMAGE_ID, res);
   } catch {
     res.status(500).send("Error fetching image");
   }

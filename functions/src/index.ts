@@ -23,6 +23,6 @@ import * as admin from "firebase-admin";
 setGlobalOptions({region: "europe-west1", maxInstances: 10});
 admin.initializeApp();
 
-export {updateGuestProfile, getImage} from "./user_controller";
+export {checkDisplayName, getImage, avatarImage} from "./user_controller";
 export {createRoom, completeRoom} from "./room_controller";
 export {generateClue, guessPlayer} from "./bot_controller";

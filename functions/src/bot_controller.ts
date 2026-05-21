@@ -123,5 +123,5 @@ export const guessPlayer = onRequest({cors: true}, (req, res) => {
     res.status(500).json({error: "Internal error"});
     return;
   }
-  res.json({player: pick});
+  res.json(pick);
 });
