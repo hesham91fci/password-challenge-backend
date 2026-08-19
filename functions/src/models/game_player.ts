@@ -1,5 +1,5 @@
 export interface GamePlayer {
-  id: string;
+  id: number;
   dob: string | null;
   name: string | null;
   nationality: string | null;

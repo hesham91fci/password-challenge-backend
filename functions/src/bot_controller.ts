@@ -30,8 +30,13 @@ const players: GamePlayer[] = (() => {
     if (typeof id !== "number" && typeof id !== "string") {
       throw new Error(`players.json: invalid id at index ${i}`);
     }
+    const parsedId =
+      typeof id === "number" ? id : Number.parseInt(id, 10);
+    if (!Number.isInteger(parsedId)) {
+      throw new Error(`players.json: invalid id at index ${i}`);
+    }
     return {
-      id: String(id),
+      id: parsedId,
       dob: typeof o.dob === "string" || o.dob === null ? o.dob : null,
       name: typeof o.name === "string" || o.name === null ? o.name : null,
       nationality:
@@ -102,13 +107,12 @@ export const guessPlayer = onRequest({cors: true}, (req, res) => {
     res.status(400).json({error: "correctPlayerId must be an integer"});
     return;
   }
-  const correctIdKey = String(correctPlayerId);
-  const correct = players.find((p) => p.id === correctIdKey);
+  const correct = players.find((p) => p.id === correctPlayerId);
   if (!correct) {
     res.status(404).json({error: "Player not found"});
     return;
   }
-  const others = players.filter((p) => p.id !== correctIdKey);
+  const others = players.filter((p) => p.id !== correctPlayerId);
   if (others.length < DECOY_COUNT) {
     res.status(400).json({
       error: `Need at least ${POOL_SIZE} distinct players in data`,
