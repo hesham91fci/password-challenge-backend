@@ -1,4 +1,5 @@
 import {GamePlayer} from "./game_player";
+import type {Difficulty} from "./difficulty";
 import type {PausedRoomUser} from "./paused_room_user";
 import type {RoomType} from "./room_type";
 import type {Team} from "./team";
@@ -11,6 +12,7 @@ export interface Room {
   id: string;
   code: string;
   type: RoomType;
+  difficulty: Difficulty;
   turnsPerRound: Team[];
   playersToGuess: GamePlayer[];
   usersCount: number;
@@ -24,4 +26,5 @@ export interface Room {
   pausedPresentUserIds?: string[] | null;
   turnDurationInSeconds: number;
   isRecordingAllowed: boolean;
+  shouldRestartRoom: boolean;
 }

@@ -1,29 +1,27 @@
 import {onRequest} from "firebase-functions/https";
 import type {Request} from "firebase-functions/https";
-import {FieldValue, getFirestore} from "firebase-admin/firestore";
+import {getFirestore} from "firebase-admin/firestore";
 import type {
   DocumentReference,
   Firestore,
   QuerySnapshot,
 } from "firebase-admin/firestore";
 import {
-  onDocumentCreated,
   onDocumentDeleted,
+  onDocumentWritten,
 } from "firebase-functions/v2/firestore";
 import {
   ALTERNATIVE_VOTE_THRESHOLD,
   ALLOWED_TURN_DURATIONS,
   DEFAULT_TURN_DURATION_SECONDS,
 } from "./constants/game_settings";
+import type {Difficulty} from "./models/difficulty";
+import {DEFAULT_DIFFICULTY} from "./models/difficulty";
 import type {Room} from "./models/room";
-import type {
-  FinalAssignment,
-  RoleAssignment,
-  TeamAssignment,
-} from "./models/room_assignment";
 import type {RoomUser} from "./models/room_user";
 import type {RoomType} from "./models/room_type";
-import type {Team} from "./models/team";
+import {planRoomCompletion} from "./room_completion";
+import {logger} from "firebase-functions/v1";
 
 const CODE_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -111,6 +109,25 @@ function parseTurnDuration(value: unknown): number | null {
 }
 
 /**
+ * Parses difficulty; returns default when absent.
+ * @param {unknown} value Raw body value.
+ * @return {Difficulty | null} Allowed difficulty, or null when invalid.
+ */
+function parseDifficulty(value: unknown): Difficulty | null {
+  if (value === undefined || value === null) {
+    return DEFAULT_DIFFICULTY;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed === "easy" || trimmed === "medium" || trimmed === "hard") {
+    return trimmed;
+  }
+  return null;
+}
+
+/**
  * Builds a random 6-character room code using A–Z and a–z.
  * @return {string} Six-character code.
  */
@@ -121,93 +138,6 @@ function randomRoomCode(): string {
     code += CODE_ALPHABET[idx];
   }
   return code;
-}
-
-/**
- * Shuffles users in a new array.
- * @param {string[]} users User ids.
- * @return {string[]} Shuffled user ids.
- */
-function shuffleUsers(users: string[]): string[] {
-  const shuffled = [...users];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-  }
-  return shuffled;
-}
-
-/**
- * Splits shuffled users into team1 and team2.
- * @param {string[]} shuffledUserIds Shuffled user ids.
- * @return {TeamAssignment[]} Team assignments.
- */
-function assignTeams(shuffledUserIds: string[]): TeamAssignment[] {
-  if (shuffledUserIds.length !== 4) {
-    throw new Error("assignTeams requires exactly 4 users");
-  }
-  return shuffledUserIds.map((userId, index) => ({
-    userId,
-    team: index < 2 ? "team1" : "team2",
-  }));
-}
-
-/**
- * Assigns one clueGiver and one clueGuesser per team.
- * @param {TeamAssignment[]} teamAssignments Team assignments.
- * @return {RoleAssignment[]} Team and role assignments.
- */
-function assignRolesPerTeam(
-  teamAssignments: TeamAssignment[],
-): RoleAssignment[] {
-  const teams: Team[] = ["team1", "team2"];
-  const result: RoleAssignment[] = [];
-
-  for (const team of teams) {
-    const usersInTeam = teamAssignments.filter((u) => u.team === team);
-    if (usersInTeam.length !== 2) {
-      throw new Error(`assignRolesPerTeam requires 2 users in ${team}`);
-    }
-
-    const giverIndex = Math.floor(Math.random() * 2);
-    result.push({
-      userId: usersInTeam[giverIndex].userId,
-      team,
-      role: "clueGiver",
-    });
-    result.push({
-      userId: usersInTeam[1 - giverIndex].userId,
-      team,
-      role: "clueGuesser",
-    });
-  }
-
-  return result;
-}
-
-/**
- * Chooses the starting team.
- * @return {Team} Selected starting team.
- */
-function pickStartingTeam(): Team {
-  return Math.random() < 0.5 ? "team1" : "team2";
-}
-
-/**
- * Marks active turn on selected team's clueGiver only.
- * @param {RoleAssignment[]} roleAssignments Team and role assignments.
- * @param {Team} startingTeam Team selected to start.
- * @return {FinalAssignment[]} Final assignments with active turn marker.
- */
-function markActiveTurn(
-  roleAssignments: RoleAssignment[],
-  startingTeam: Team,
-): FinalAssignment[] {
-  return roleAssignments.map((assignment) => ({
-    ...assignment,
-    isActiveTurn:
-      assignment.team === startingTeam && assignment.role === "clueGiver",
-  }));
 }
 
 /**
@@ -272,7 +202,8 @@ async function deleteRoomTree(
 /**
  * POST /createRoom
  * Body: `{ "uid": string, "roomType": "public" | "private",
- * "isRecordingAllowed"?: boolean, "turnDurationInSeconds"?: 20 | 30 | 40 }`.
+ * "isRecordingAllowed"?: boolean, "turnDurationInSeconds"?: 20 | 30 | 40,
+ * "difficulty"?: "easy" | "medium" | "hard" }`.
  * Verifies `users/{uid}` exists, then creates `rooms/{autoId}` with Firestore’s
  * generated document id stored as `id` and a distinct random `code` field.
  * Host is written to `rooms/{roomId}/users/{uid}`.
@@ -339,6 +270,16 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
     return;
   }
 
+  const difficulty = parseDifficulty(
+    "difficulty" in body ?
+      (body as {difficulty: unknown}).difficulty :
+      undefined,
+  );
+  if (difficulty === null) {
+    res.status(400).json({success: false, error: "Invalid difficulty"});
+    return;
+  }
+
   const db = getFirestore();
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
@@ -376,6 +317,7 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
             id: roomRef.id,
             code,
             type: roomType,
+            difficulty,
             turnsPerRound: [],
             playersToGuess: [],
             usersCount: 1,
@@ -386,6 +328,7 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
             remainingAlternativeVotes: ALTERNATIVE_VOTE_THRESHOLD,
             turnDurationInSeconds,
             isRecordingAllowed,
+            shouldRestartRoom: false,
           };
           tx.set(roomRef, roomData);
           tx.set(roomRef.collection("users").doc(uid), hostRoomUser);
@@ -414,16 +357,22 @@ export const createRoom = onRequest({cors: true}, async (req, res) => {
 });
 
 /**
- * When a room user doc is created, completes team/role assignment once four
- * distinct users exist and roles are not yet set.
+ * When a room user doc is created or updated, completes team/role assignment
+ * once four distinct users exist and roles are not yet set. Re-runs after
+ * restart when roles are cleared again (ignores prior turnsPerRound).
+ * Teams always come from the client (2v2 required); roles and the starting
+ * team are assigned here.
  */
-export const completeRoom = onDocumentCreated(
+export const completeRoom = onDocumentWritten(
   {
     document: "rooms/{roomId}/users/{userId}",
   },
   async (event) => {
     const roomId = event.params.roomId;
     if (!roomId) {
+      return;
+    }
+    if (!event.data?.after.exists) {
       return;
     }
 
@@ -441,43 +390,21 @@ export const completeRoom = onDocumentCreated(
           return;
         }
 
-        if (
-          Array.isArray(roomData.turnsPerRound) &&
-          roomData.turnsPerRound.length > 0
-        ) {
-          return;
-        }
-
         const usersQuery = roomRef.collection("users").limit(16);
         const usersSnap = await tx.get(usersQuery);
-        if (usersSnap.size !== 4) {
-          return;
-        }
-
         const userDocs = usersSnap.docs;
-        const ids = userDocs.map((d) => d.id);
-        if (new Set(ids).size !== 4) {
+        const plan = planRoomCompletion(
+          userDocs.map((d) => {
+            const data = d.data() as {role?: unknown; team?: unknown};
+            return {id: d.id, role: data.role ?? null, team: data.team ?? null};
+          }),
+        );
+        if (plan == null) {
           return;
         }
-
-        for (const d of userDocs) {
-          const role = (d.data() as {role?: unknown}).role;
-          if (role != null) {
-            return;
-          }
-        }
-
-        const shuffled = shuffleUsers([...ids]);
-        const teamAssignments = assignTeams(shuffled);
-        const roleAssignments = assignRolesPerTeam(teamAssignments);
-        const startingTeam = pickStartingTeam();
-        const finalAssignments = markActiveTurn(
-          roleAssignments,
-          startingTeam,
-        );
 
         const assignmentByUserId = new Map(
-          finalAssignments.map((a) => [a.userId, a]),
+          plan.assignments.map((a) => [a.userId, a]),
         );
 
         for (const d of userDocs) {
@@ -506,10 +433,12 @@ export const completeRoom = onDocumentCreated(
         tx.set(
           roomRef,
           {
-            turnsPerRound: FieldValue.arrayUnion(startingTeam),
+            turnsPerRound: [plan.startingTeam],
+            shouldRestartRoom: false,
           },
           {merge: true},
         );
+        logger.info("flipped shouldRestartRoom to false");
       });
     } catch (error) {
       console.error("Error completing room setup:", error);
@@ -545,7 +474,27 @@ export const cleanupRoom = onDocumentDeleted(
         return;
       }
 
-      await deleteRoomTree(db, roomRef);
+      // Re-check immediately before delete to avoid wiping a lobby that
+      // gained a human (or lost bots-only status) after the first read.
+      const roomSnapBeforeDelete = await roomRef.get();
+      if (!roomSnapBeforeDelete.exists) {
+        return;
+      }
+      const usersSnapBeforeDelete = await roomRef.collection("users").get();
+      if (!shouldDeleteRoom(usersSnapBeforeDelete)) {
+        return;
+      }
+
+      try {
+        await deleteRoomTree(db, roomRef);
+      } catch (deleteError) {
+        console.error(
+          "Error recursively deleting room tree:",
+          roomId,
+          deleteError,
+        );
+        throw deleteError;
+      }
     } catch (error) {
       console.error("Error cleaning up room:", roomId, error);
     }

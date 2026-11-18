@@ -26,3 +26,4 @@ admin.initializeApp();
 export {checkDisplayName, getImage, avatarImage} from "./user_controller";
 export {createRoom, completeRoom, cleanupRoom} from "./room_controller";
 export {generateClue, guessPlayer} from "./bot_controller";
+export {onPresenceWritten, removeStaleRoomUser} from "./presence_controller";
